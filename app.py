@@ -490,6 +490,7 @@
 # ==== keep TensorFlow/Keras out of Transformers (must be first) ====
 # ==== keep TensorFlow/Keras out of Transformers (must be first) ====
 # ==== keep TensorFlow/Keras out of Transformers (must be first) ====
+# ==== keep TensorFlow/Keras out of Transformers (must be first) ====
 import os
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 os.environ["USE_TF"] = "0"
@@ -590,8 +591,8 @@ def get_pdf_text(pdf_docs):
 def get_text_chunks(text: str):
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", " ", ""],
-        chunk_size=300,     # small to fit T5's ~512-token window w/ prompt
-        chunk_overlap=60,
+        chunk_size=500,     # small to fit T5's ~512-token window w/ prompt
+        chunk_overlap=96,
         length_function=len,
     )
     return splitter.split_text(text)
@@ -660,7 +661,7 @@ def load_local_llm():
         tok = AutoTokenizer.from_pretrained(model_id)
         model = AutoModelForSeq2SeqLM.from_pretrained(
             model_id,
-            torch_dtype=(dtype if device != "cpu" else torch.float32),
+            dtype=(dtype if device != "cpu" else torch.float32),  # <-- use dtype (not torch_dtype)
             low_cpu_mem_usage=True,
         )
         if device != "cpu":
@@ -669,10 +670,12 @@ def load_local_llm():
             task="text2text-generation",
             model=model,
             tokenizer=tok,
-            max_new_tokens=256,
-            do_sample=False,       # deterministic
-            num_beams=4,           # quality bump
-            repetition_penalty=1.05,
+            max_new_tokens=192,      # leave room for input
+            min_new_tokens=48,
+            do_sample=False,         # deterministic, better for QA
+            num_beams=6,             # quality bump
+            length_penalty=1.05,
+            no_repeat_ngram_size=3,
         )
         return HuggingFacePipeline(pipeline=gen)
 
@@ -704,18 +707,24 @@ def get_conversation_chain(vectorstore):
     # Use MMR to keep 3 diverse, short chunks in context
     retriever = vectorstore.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 3, "fetch_k": 15, "lambda_mult": 0.5},
+        search_kwargs={"k": 4, "fetch_k": 24, "lambda_mult": 0.3},
     )
 
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+    memory = ConversationBufferMemory(
+        memory_key="chat_history", 
+        return_messages=True,
+        output_key="answer",
+        )
 
+    # IMPORTANT: return sources so we can detect empty retrieval and fallback
     chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
         retriever=retriever,
         memory=memory,
         combine_docs_chain_kwargs={"prompt": QA_PROMPT},
         condense_question_prompt=CONDENSE_PROMPT,
-        return_source_documents=False,
+        return_source_documents=True,
+        output_key="answer",   # <-- added
     )
     return chain
 
@@ -723,9 +732,14 @@ def get_conversation_chain(vectorstore):
 # -----------------------------
 # One-click summarization
 # -----------------------------
+@st.cache_resource(show_spinner=False)
+def _summarizer_llm():
+    # reuse the same local model for summarization chain
+    return load_local_llm()
+
 def summarize_all_chunks(text_chunks):
     """Map-reduce summary over the whole document using the same local LLM."""
-    llm = load_local_llm()
+    llm = _summarizer_llm()
     docs = [Document(page_content=t) for t in text_chunks]
     chain = load_summarize_chain(llm, chain_type="map_reduce")
     return chain.run(docs)
@@ -734,22 +748,36 @@ def summarize_all_chunks(text_chunks):
 # -----------------------------
 # UI helpers
 # -----------------------------
-def handle_userinput(user_question):
-    # use invoke() to avoid deprecation warnings
-    response = st.session_state.conversation.invoke({"question": user_question})
-    st.session_state.chat_history = response["chat_history"]
+def _looks_like_summary_request(q: str) -> bool:
+    ql = (q or "").lower()
+    return any(
+        key in ql
+        for key in ["what is this about", "what is this pdf about", "summarize", "summary", "overview"]
+    )
 
+def handle_userinput(user_question):
+    # call with invoke() to avoid deprecation warnings
+    resp = st.session_state.conversation.invoke({"question": user_question})
+    st.session_state.chat_history = resp.get("chat_history", [])
+    answer = resp.get("answer", "")
+    sources = resp.get("source_documents") or []
+
+    # If user asked for a summary/what-is-this-about AND retrieval was empty,
+    # automatically fall back to a whole-PDF summary.
+    retrieval_empty = (len(sources) == 0) or ("I couldn't find that in the documents." in answer)
+    if _looks_like_summary_request(user_question) and retrieval_empty:
+        if st.session_state.get("text_chunks"):
+            with st.spinner("Summarizing the whole PDF..."):
+                answer = summarize_all_chunks(st.session_state.text_chunks)
+
+    # render chat history
     for i, message in enumerate(st.session_state.chat_history):
-        if i % 2 == 0:
-            st.write(
-                user_template.replace("{{MSG}}", message.content),
-                unsafe_allow_html=True,
-            )
-        else:
-            st.write(
-                bot_template.replace("{{MSG}}", message.content),
-                unsafe_allow_html=True,
-            )
+        html = user_template if i % 2 == 0 else bot_template
+        st.write(html.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+
+    # also render the (possibly replaced) answer explicitly if history didn’t include it
+    if answer and (not st.session_state.chat_history or st.session_state.chat_history[-1].content != answer):
+        st.write(bot_template.replace("{{MSG}}", answer), unsafe_allow_html=True)
 
 
 # -----------------------------
